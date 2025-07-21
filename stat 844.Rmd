@@ -1,0 +1,145 @@
+---
+title: "stat844"
+output: pdf_document
+---
+
+
+```{r}
+# Load libraries
+library(tidyverse)
+library(glmnet)
+library(mgcv)
+library(pROC)
+library(MLmetrics)
+library(ranger)
+library(ggplot2)
+
+# Read and prepare data
+data = read.csv("OnlineNewsPopularity.csv")
+data = na.omit(data)
+data$popular = factor(ifelse(data$shares > 1400, "1", "0"))
+
+selected_features = c(
+  "n_tokens_title", "n_tokens_content", "num_imgs", "num_videos", "num_keywords",
+  "data_channel_is_entertainment", "data_channel_is_socmed", "data_channel_is_tech",
+  "kw_avg_avg", "weekday_is_saturday", "weekday_is_sunday", "is_weekend",
+  "global_sentiment_polarity", "title_sentiment_polarity", "popular"
+)
+df = data[, selected_features]
+
+# Create 5-fold CV indices
+set.seed(844)
+folds = sample(rep(1:5, length.out = nrow(df)))
+
+# Function to evaluate predictions
+evaluate = function(true, pred) {
+  data.frame(
+    Accuracy = Accuracy(pred, true),
+    Precision = Precision(pred, true, positive = "1"),
+    Recall = Recall(pred, true, positive = "1"),
+    F1 = F1_Score(pred, true, positive = "1")
+  )
+}
+
+# Initialize results and storage for ROC
+results_lasso = results_ridge = results_gam = results_rf = data.frame()
+roc_lasso = roc_ridge = roc_gam = roc_rf = list()
+
+# Perform 5-fold CV
+for (k in 1:5) {
+  cat("Fold", k, "\n")
+  train = df[folds != k, ]
+  test = df[folds == k, ]
+  
+  X_train = scale(as.matrix(train[, -ncol(train)]))
+  X_test = scale(as.matrix(test[, -ncol(test)]), center = attr(X_train, "scaled:center"),
+                 scale = attr(X_train, "scaled:scale"))
+  y_train = train$popular
+  y_test = test$popular
+  
+  # Lasso
+  lasso_fit = cv.glmnet(X_train, y_train, family = "binomial", alpha = 1)
+  lasso_prob = predict(lasso_fit, newx = X_test, s = "lambda.min", type = "response")
+  lasso_pred = ifelse(lasso_prob > 0.5, "1", "0")
+  results_lasso = rbind(results_lasso, evaluate(y_test, lasso_pred))
+  roc_lasso[[k]] = roc(as.numeric(as.character(y_test)), as.vector(lasso_prob))
+  
+  # Ridge
+  ridge_fit = cv.glmnet(X_train, y_train, family = "binomial", alpha = 0)
+  ridge_prob = predict(ridge_fit, newx = X_test, s = "lambda.min", type = "response")
+  ridge_pred = ifelse(ridge_prob > 0.5, "1", "0")
+  results_ridge = rbind(results_ridge, evaluate(y_test, ridge_pred))
+  roc_ridge[[k]] = roc(as.numeric(as.character(y_test)), as.vector(ridge_prob))
+  
+  # GAM
+  cont_vars = names(train)[-ncol(train)]
+  is_categorical = sapply(train[, cont_vars], function(x) {
+    ux = unique(x)
+    length(ux) == 2 && all(sort(ux) == c(0, 1))
+  })
+  cat_vars = cont_vars[is_categorical]
+  num_vars = cont_vars[!is_categorical]
+  
+  smooth_terms = paste0("s(", num_vars, ")", collapse = " + ")
+  linear_terms = paste(cat_vars, collapse = " + ")
+  all_terms = paste(c(smooth_terms, linear_terms), collapse = " + ")
+  gam_formula = as.formula(paste("popular ~", all_terms))
+  
+  gam_fit = gam(gam_formula, data = train, family = binomial(link = "logit"))
+  gam_prob = predict(gam_fit, newdata = test, type = "response")
+  gam_pred = ifelse(gam_prob > 0.5, "1", "0")
+  results_gam = rbind(results_gam, evaluate(y_test, gam_pred))
+  roc_gam[[k]] = roc(as.numeric(as.character(y_test)), as.vector(gam_prob))
+  
+  # Random Forest (ranger)
+  rf_fit = ranger(
+    formula = popular ~ .,
+    data = train,
+    num.trees = 500,
+    probability = TRUE,
+    importance = "impurity"
+  )
+  rf_prob = predict(rf_fit, data = test)$predictions[, "1"]
+  rf_pred = ifelse(rf_prob > 0.5, "1", "0")
+  results_rf = rbind(results_rf, evaluate(y_test, rf_pred))
+  roc_rf[[k]] = roc(as.numeric(as.character(y_test)), rf_prob)
+}
+
+# Summarize mean metrics
+summary_table = rbind(
+  Lasso = colMeans(results_lasso),
+  Ridge = colMeans(results_ridge),
+  GAM = colMeans(results_gam),
+  RandomForest = colMeans(results_rf)
+)
+print(round(summary_table, 4))
+
+# Plot ROC curves (Fold 1 only for clarity)
+plot(roc_ridge[[1]], col = "red", main = "ROC Curve")
+plot(roc_rf[[1]], col = "blue", add = TRUE)
+legend("bottomright", legend = c("Ridge", "Random Forest"),
+       col = c( "red","blue"), lty = 1)
+
+cat("Mean AUC:\n")
+cat("Lasso:", mean(sapply(roc_lasso, auc)), "\n")
+cat("Ridge:", mean(sapply(roc_ridge, auc)), "\n")
+cat("GAM:", mean(sapply(roc_gam, auc)), "\n")
+cat("RF:", mean(sapply(roc_rf, auc)), "\n")
+
+importance_df = as.data.frame(sort(rf_fit$variable.importance, decreasing = TRUE))
+colnames(importance_df) = "Importance"
+importance_df$Feature = rownames(importance_df)
+importance_df = importance_df[, c("Feature", "Importance")]
+
+print(importance_df)
+
+ggplot(importance_df, aes(x = reorder(Feature, Importance), y = Importance)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  labs(title = "Variable Importance from Random Forest",
+       x = "Feature",
+       y = "Importance")
+
+```
+
+
